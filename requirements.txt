@@ -1,0 +1,17 @@
+# Slack Drive Bot — Python dependencies
+# Install with: pip install -r requirements.txt
+
+# Slack
+slack-bolt>=1.18.0          # Bolt framework (includes Socket Mode support)
+websocket-client>=1.6.0     # Required for Socket Mode
+
+# Google Drive
+google-api-python-client>=2.100.0
+google-auth>=2.23.0
+google-auth-httplib2>=0.1.0
+
+# Anthropic
+anthropic>=0.40.0
+
+# Utilities
+python-dotenv>=1.0.0        # Loads .env file automatically

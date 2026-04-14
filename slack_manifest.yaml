@@ -1,0 +1,66 @@
+display_information:
+  name: Drive Bot
+  description: Ask a question, get a link. Searches the Metalios Shared Drive using natural language.
+  background_color: "#1a1a2e"
+features:
+  bot_user:
+    display_name: Resources
+    always_online: true
+  assistant_view:
+    assistant_description: Find files and answers from the Metalios Shared Drive. Ask a question and get a direct link — or ask about content and I'll read the doc for you.
+  slash_commands:
+    - command: /help
+      description: Find a file in the Shared Drive — only you see the results
+      usage_hint: "what are you looking for?"
+      should_escape: false
+oauth_config:
+  scopes:
+    user:
+      - search:read.public
+      - search:read.private
+      - search:read.mpim
+      - search:read.im
+      - search:read.files
+      - search:read.users
+      - chat:write
+      - channels:history
+      - groups:history
+      - mpim:history
+      - im:history
+      - canvases:read
+      - canvases:write
+      - users:read
+      - users:read.email
+    user_optional:
+      - search:read.private
+      - search:read.mpim
+      - search:read.im
+      - search:read.files
+      - chat:write
+      - groups:history
+      - mpim:history
+      - im:history
+      - canvases:read
+      - canvases:write
+    bot:
+      - app_mentions:read
+      - chat:write
+      - reactions:write
+      - im:history
+      - im:read
+      - im:write
+      - assistant:write
+      - commands
+  pkce_enabled: false
+settings:
+  event_subscriptions:
+    bot_events:
+      - app_mention
+      - message.im
+      - assistant_thread_started
+  interactivity:
+    is_enabled: true
+  org_deploy_enabled: false
+  socket_mode_enabled: true
+  token_rotation_enabled: false
+  is_mcp_enabled: true
