@@ -13,5 +13,12 @@ google-auth-httplib2>=0.1.0
 # Anthropic
 anthropic>=0.40.0
 
+# OpenAI (embeddings only — text-embedding-3-small for RAG)
+openai>=1.30.0
+
+# RAG — vector store + PDF parsing
+chromadb>=0.5.0
+pypdf>=4.0.0
+
 # Utilities
 python-dotenv>=1.0.0        # Loads .env file automatically

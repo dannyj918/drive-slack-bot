@@ -16,12 +16,14 @@ An AI-powered Slack bot that lets the Metalios real estate team find files in th
 
 ## Architecture
 
-Three source files, each with a single responsibility:
+Five source files with clear responsibilities:
 
 ```
-bot.py            Slack event handlers, orchestration, entry point
-drive_search.py   Google Drive API — authentication and file search
-ai_handler.py     Anthropic Claude — agentic search loop with tool use
+bot.py             Slack event handlers, orchestration, entry point
+drive_search.py    Google Drive API — authentication and file search
+ai_handler.py      Anthropic Claude — agentic search loop with tool use
+rag_retriever.py   Query-time RAG: embed question → semantic chunk search
+rag_indexer.py     Index pipeline: parse Drive files → embed → store in Chroma
 ```
 
 ### Data flow
@@ -32,12 +34,21 @@ Slack event
     → _search_and_respond(question)
       → ai_handler.py: build_response(question)
         → Claude agentic loop (up to 4 rounds)
-          → tool call: search_drive(query)
-            → drive_search.py: search_shared_drive(query)
-              ← list[dict] of file metadata
-          ← Claude picks relevant files, formats Slack mrkdwn
+          → tool call: search(query)  ← single unified tool
+            → drive_search.py: search_shared_drive(query)  ← file links
+            → rag_retriever.py: search(query)              ← content chunks
+              ← combined {files, content_chunks} payload
+          ← Claude answers from content (with citation) or returns file links
       ← formatted response string
   → say() / respond() back to Slack
+
+Separately (run on a schedule):
+  rag_indexer.py
+    → lists all Shared Drive files
+    → exports/downloads and parses each (Google Docs → text, PDFs → pypdf)
+    → chunks text and embeds via OpenAI text-embedding-3-small
+    → upserts into local Chroma vector DB (./chroma_db/)
+    → saves Drive Changes API token for incremental future runs
 ```
 
 ---
@@ -71,15 +82,47 @@ All secrets live in `.env` (never committed). See `.env.example` for the full te
 | `SLACK_BOT_TOKEN` | yes | — | Bot OAuth token (`xoxb-…`) |
 | `SLACK_APP_TOKEN` | yes | — | App-level token for Socket Mode (`xapp-…`) |
 | `ANTHROPIC_API_KEY` | yes | — | Anthropic console API key |
+| `OPENAI_API_KEY` | yes (for RAG) | — | OpenAI key for `text-embedding-3-small` embeddings |
 | `GOOGLE_SERVICE_ACCOUNT_FILE` | yes | `service_account.json` | Path to service account JSON key |
 | `SHARED_DRIVE_ID` | yes | — | Google Shared Drive ID (from the drive URL) |
 | `CLAUDE_MODEL` | no | `claude-sonnet-4-5` | Swap to `claude-haiku-4-5-20251001` for speed/cost |
+| `CHROMA_DB_PATH` | no | `./chroma_db` | Where Chroma persists the vector DB on disk |
 
 The service account JSON file is gitignored — it must be placed manually.
+
+**Embedding cost:** `text-embedding-3-small` costs $0.02/million tokens. A full initial index of 100–200 docs ≈ $0.01–0.05 total. Incremental syncs (changed files only) cost nearly nothing.
 
 ---
 
 ## Key Files Reference
+
+### `rag_indexer.py`
+
+| Lines | Symbol | Purpose |
+|---|---|---|
+| 60–65 | `_EXPORTABLE` | MIME types Drive can export as text/plain or text/csv |
+| 78–88 | `_build_drive_service()` | Authenticated Drive v3 service (same pattern as `drive_search.py`) |
+| 96–122 | `list_all_files()` | Paginates through all non-trashed Shared Drive files |
+| 125–162 | `extract_text(file)` | Exports Google Workspace files; downloads + pypdf-parses PDFs |
+| 165–179 | `chunk_text(text)` | Splits text into 500-word overlapping chunks |
+| 182–193 | `embed_texts(texts)` | Batched OpenAI `text-embedding-3-small` embeddings |
+| 196–228 | `index_file(file, collection)` | Full pipeline for one file; deletes stale chunks before upserting |
+| 231–255 | `_save_token / _load_token / _get_start_token` | Drive Changes API token persistence (`changes_token.txt`) |
+| 258–281 | `full_sync(collection)` | Indexes everything; saves start token |
+| 284–330 | `incremental_sync(collection)` | Re-indexes only changed files using Changes API |
+
+Run manually: `python rag_indexer.py` (incremental if `changes_token.txt` exists, full otherwise).
+Force full re-index: `python rag_indexer.py --full`.
+
+### `rag_retriever.py`
+
+| Lines | Symbol | Purpose |
+|---|---|---|
+| 28–37 | `_get_openai_client()` | Lazy singleton OpenAI client |
+| 40–57 | `_get_collection()` | Lazy-loads Chroma collection; returns `None` gracefully if not yet indexed |
+| 60–96 | `search(query, n_results=5)` | Embeds query → Chroma semantic search → returns `[{text, file_name, file_link}]` |
+
+Returns `[]` if the index hasn't been built yet — bot falls back to Drive file links only.
 
 ### `bot.py`
 
@@ -112,17 +155,17 @@ Results are ordered by `modifiedTime desc`. Special characters in `query` are es
 |---|---|---|
 | 28–29 | `MAX_SEARCH_ROUNDS`, `CLAUDE_MODEL` | Module-level constants; model is overridable via env var |
 | 32–36 | `_get_client()` | Lazy singleton Anthropic client |
-| 43–72 | `_TOOLS` | `search_drive` tool definition for Claude tool use |
-| 79–99 | `_SYSTEM` | System prompt — Slack mrkdwn formatting rules, 4-file max, no preamble |
+| 43–72 | `_TOOLS` | Single unified `search` tool for Claude tool use |
+| 79–103 | `_SYSTEM` | System prompt — content vs file-link response rules, Slack mrkdwn formatting |
 | 106–199 | `build_response(question, _files=None)` | Agentic loop: sends question → handles `tool_use` / `end_turn` |
 | 202–203 | `_escape(text)` | HTML-escapes `&`, `<`, `>` for safe Slack mrkdwn embedding |
 
 The `_files` parameter in `build_response` is accepted but ignored — the agentic loop does its own searching. `bot.py` passes files for historical compatibility.
 
 **Agentic loop logic (ai_handler.py:127–198):**
-1. Send user question to Claude with `search_drive` tool available
+1. Send user question to Claude with the single `search` tool available
 2. `stop_reason == "end_turn"` → extract text block, return it
-3. `stop_reason == "tool_use"` → execute `search_shared_drive`, append results as `tool_result`, increment `rounds`
+3. `stop_reason == "tool_use"` → call both `search_shared_drive` and `rag_retriever.search`, combine results into `{files, content_chunks}` JSON, append as `tool_result`, increment `rounds`
 4. Repeat up to `MAX_SEARCH_ROUNDS` (4)
 5. If loop exhausts without `end_turn`, return a fallback "couldn't find a confident match" message
 
@@ -165,6 +208,26 @@ The `_files` parameter in `build_response` is accepted but ignored — the agent
 ---
 
 ## Common Development Tasks
+
+**Build the RAG index for the first time:**
+```bash
+python rag_indexer.py
+```
+Downloads model, exports all Drive files, embeds and stores in `./chroma_db/`. Saves a `changes_token.txt` for future incremental runs.
+
+**Refresh the index after Drive changes:**
+```bash
+python rag_indexer.py          # incremental (uses changes_token.txt)
+python rag_indexer.py --full   # force full re-index
+```
+
+**Schedule automatic incremental syncs (cron every 30 min):**
+```
+*/30 * * * * cd /path/to/drive-slack-bot && .venv/bin/python rag_indexer.py
+```
+
+**Add support for a new file type in the RAG index:**
+Edit `_EXPORTABLE` in `rag_indexer.py` to add a MIME type → export MIME mapping. For binary formats (like `.docx`), add a new branch in `extract_text()`.
 
 **Add a new file type emoji/label:**
 Edit `_MIME_META` in `drive_search.py:32–43`. Add a MIME type → `(emoji, label)` entry. The fallback is `("📎", "File")` (drive_search.py:113).

@@ -3,3 +3,7 @@
 .venv
 __pycache__
 metalios-team-e1c88112ce83.json
+
+# RAG — local vector DB and Drive Changes API token (machine-specific)
+chroma_db/
+changes_token.txt
