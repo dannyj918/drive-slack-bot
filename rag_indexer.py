@@ -1,0 +1,403 @@
+"""
+RAG indexer
+===========
+Standalone script that indexes Google Shared Drive files into a local Chroma
+vector database for semantic search.
+
+First run  → full sync: all files are indexed, a Changes API page token is saved.
+Later runs → incremental sync: only files added/modified/deleted since the last
+             run are re-indexed. This keeps re-runs fast.
+
+Usage:
+  python rag_indexer.py          # auto-detects full vs incremental
+  python rag_indexer.py --full   # force a full re-index
+
+Schedule with cron (every 30 minutes):
+  */30 * * * * cd /path/to/drive-slack-bot && .venv/bin/python rag_indexer.py
+"""
+
+import argparse
+import io
+import logging
+import os
+import sys
+import tempfile
+
+import chromadb
+import openai
+import pypdf
+from dotenv import load_dotenv
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+from googleapiclient.http import MediaIoBaseDownload
+
+load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+EMBEDDING_MODEL    = "text-embedding-3-small"
+COLLECTION_NAME    = "drive_docs"
+CHANGES_TOKEN_FILE = "changes_token.txt"
+CHUNK_SIZE         = 500   # words per chunk
+CHUNK_OVERLAP      = 50    # word overlap between chunks
+EMBED_BATCH_SIZE   = 100   # max texts per OpenAI embedding request
+
+_SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
+
+# MIME types that Drive can export as plain text
+_EXPORTABLE: dict[str, str] = {
+    "application/vnd.google-apps.document":     "text/plain",
+    "application/vnd.google-apps.spreadsheet":  "text/csv",
+    "application/vnd.google-apps.presentation": "text/plain",
+    "application/vnd.google-apps.form":         "text/plain",
+}
+
+# ---------------------------------------------------------------------------
+# Clients (lazy singletons)
+# ---------------------------------------------------------------------------
+
+_drive_service = None
+_openai_client: openai.OpenAI | None = None
+
+
+def _build_drive_service():
+    global _drive_service
+    if _drive_service is not None:
+        return _drive_service
+    key_file = os.environ.get("GOOGLE_SERVICE_ACCOUNT_FILE", "service_account.json")
+    creds = service_account.Credentials.from_service_account_file(
+        key_file, scopes=_SCOPES
+    )
+    _drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
+    return _drive_service
+
+
+def _get_openai_client() -> openai.OpenAI:
+    global _openai_client
+    if _openai_client is None:
+        _openai_client = openai.OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    return _openai_client
+
+
+def _get_chroma_collection() -> chromadb.Collection:
+    db_path = os.environ.get("CHROMA_DB_PATH", "./chroma_db")
+    client = chromadb.PersistentClient(path=db_path)
+    return client.get_or_create_collection(
+        name=COLLECTION_NAME,
+        metadata={"hnsw:space": "cosine"},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Drive helpers
+# ---------------------------------------------------------------------------
+
+def list_all_files() -> list[dict]:
+    """Page through all non-trashed files in the Shared Drive."""
+    drive_id = os.environ.get("SHARED_DRIVE_ID", "").strip()
+    if not drive_id:
+        raise ValueError("SHARED_DRIVE_ID is not set in .env")
+
+    service = _build_drive_service()
+    files = []
+    page_token = None
+
+    while True:
+        params = dict(
+            q="trashed = false",
+            corpora="drive",
+            driveId=drive_id,
+            includeItemsFromAllDrives=True,
+            supportsAllDrives=True,
+            pageSize=100,
+            fields="nextPageToken,files(id,name,mimeType,webViewLink,modifiedTime)",
+        )
+        if page_token:
+            params["pageToken"] = page_token
+
+        response = service.files().list(**params).execute()
+        files.extend(response.get("files", []))
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            break
+
+    logger.info("Found %d files in Shared Drive", len(files))
+    return files
+
+
+def extract_text(file: dict) -> str:
+    """
+    Extract plain text from a Drive file.
+
+    - Google Workspace files (Docs, Sheets, Slides, Forms): exported via Drive API.
+    - PDFs: downloaded and parsed with pypdf.
+    - Everything else: skipped (returns "").
+    """
+    service   = _build_drive_service()
+    file_id   = file["id"]
+    mime_type = file.get("mimeType", "")
+    name      = file.get("name", file_id)
+
+    if mime_type in _EXPORTABLE:
+        try:
+            data = service.files().export(
+                fileId=file_id,
+                mimeType=_EXPORTABLE[mime_type],
+            ).execute()
+            return data.decode("utf-8", errors="ignore") if isinstance(data, bytes) else str(data)
+        except HttpError as exc:
+            logger.warning("Export failed for %r: %s", name, exc)
+            return ""
+
+    if mime_type == "application/pdf":
+        try:
+            request  = service.files().get_media(fileId=file_id)
+            buf      = io.BytesIO()
+            downloader = MediaIoBaseDownload(buf, request)
+            done = False
+            while not done:
+                _, done = downloader.next_chunk()
+            buf.seek(0)
+            reader = pypdf.PdfReader(buf)
+            text = "\n".join(
+                (page.extract_text() or "") for page in reader.pages
+            )
+            return text
+        except Exception as exc:
+            logger.warning("PDF parse failed for %r: %s", name, exc)
+            return ""
+
+    logger.debug("Skipping unsupported file type %s for %r", mime_type, name)
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# Chunking + embedding
+# ---------------------------------------------------------------------------
+
+def chunk_text(text: str) -> list[str]:
+    """Split text into overlapping word-count chunks."""
+    words = text.split()
+    if not words:
+        return []
+    chunks = []
+    start = 0
+    while start < len(words):
+        end   = min(start + CHUNK_SIZE, len(words))
+        chunk = " ".join(words[start:end]).strip()
+        if chunk:
+            chunks.append(chunk)
+        start += CHUNK_SIZE - CHUNK_OVERLAP
+    return chunks
+
+
+def embed_texts(texts: list[str]) -> list[list[float]]:
+    """Embed a list of strings using OpenAI text-embedding-3-small, in batches."""
+    client = _get_openai_client()
+    embeddings: list[list[float]] = []
+
+    for i in range(0, len(texts), EMBED_BATCH_SIZE):
+        batch    = texts[i : i + EMBED_BATCH_SIZE]
+        response = client.embeddings.create(model=EMBEDDING_MODEL, input=batch)
+        embeddings.extend(item.embedding for item in response.data)
+
+    return embeddings
+
+
+# ---------------------------------------------------------------------------
+# Indexing
+# ---------------------------------------------------------------------------
+
+def index_file(file: dict, collection: chromadb.Collection) -> int:
+    """
+    Index a single Drive file into Chroma.
+    Deletes any existing chunks for this file before inserting new ones.
+    Returns the number of chunks stored (0 if the file was skipped).
+    """
+    file_id = file["id"]
+    name    = file.get("name", file_id)
+
+    text = extract_text(file)
+    if not text.strip():
+        logger.debug("No text extracted from %r — skipping", name)
+        return 0
+
+    chunks = chunk_text(text)
+    if not chunks:
+        return 0
+
+    embeddings = embed_texts(chunks)
+    ids        = [f"{file_id}_{i}" for i in range(len(chunks))]
+    metadatas  = [
+        {
+            "file_id":      file_id,
+            "file_name":    name,
+            "file_link":    file.get("webViewLink", ""),
+            "mime_type":    file.get("mimeType", ""),
+            "chunk_index":  i,
+            "modified_time": (file.get("modifiedTime") or "")[:10],
+        }
+        for i in range(len(chunks))
+    ]
+
+    # Remove stale chunks before upserting (handles file edits that shrink chunk count)
+    try:
+        collection.delete(where={"file_id": file_id})
+    except Exception:
+        pass  # collection may be empty; delete(where=...) can raise if no matches
+
+    collection.upsert(
+        ids=ids,
+        embeddings=embeddings,
+        documents=chunks,
+        metadatas=metadatas,
+    )
+
+    logger.info("Indexed %r → %d chunk(s)", name, len(chunks))
+    return len(chunks)
+
+
+# ---------------------------------------------------------------------------
+# Changes API token persistence
+# ---------------------------------------------------------------------------
+
+def _save_token(token: str) -> None:
+    with open(CHANGES_TOKEN_FILE, "w") as fh:
+        fh.write(token)
+
+
+def _load_token() -> str | None:
+    if os.path.exists(CHANGES_TOKEN_FILE):
+        with open(CHANGES_TOKEN_FILE) as fh:
+            return fh.read().strip() or None
+    return None
+
+
+def _get_start_token() -> str:
+    """Fetch the current Changes API page token (snapshot of Drive right now)."""
+    drive_id = os.environ.get("SHARED_DRIVE_ID", "").strip()
+    service  = _build_drive_service()
+    response = service.changes().getStartPageToken(
+        supportsAllDrives=True,
+        driveId=drive_id,
+    ).execute()
+    return response["startPageToken"]
+
+
+# ---------------------------------------------------------------------------
+# Sync modes
+# ---------------------------------------------------------------------------
+
+def full_sync(collection: chromadb.Collection) -> None:
+    """Index every file in the Shared Drive and save a Changes API token."""
+    # Grab the token BEFORE listing files so we don't miss changes during indexing
+    start_token = _get_start_token()
+
+    files = list_all_files()
+    total_chunks = 0
+
+    for file in files:
+        try:
+            total_chunks += index_file(file, collection)
+        except Exception as exc:
+            logger.error("Failed to index %r: %s", file.get("name"), exc)
+
+    _save_token(start_token)
+    logger.info(
+        "Full sync complete: %d file(s), %d chunk(s) indexed. Token saved.",
+        len(files),
+        total_chunks,
+    )
+
+
+def incremental_sync(collection: chromadb.Collection) -> None:
+    """Re-index only files that changed since the last run (via Drive Changes API)."""
+    token = _load_token()
+    if not token:
+        logger.warning("No changes token found — falling back to full sync")
+        full_sync(collection)
+        return
+
+    drive_id = os.environ.get("SHARED_DRIVE_ID", "").strip()
+    service  = _build_drive_service()
+    processed = 0
+
+    logger.info("Incremental sync from token: %s", token)
+
+    # The Changes API may paginate; iterate until newStartPageToken is present
+    while True:
+        response = service.changes().list(
+            pageToken=token,
+            driveId=drive_id,
+            includeItemsFromAllDrives=True,
+            supportsAllDrives=True,
+            fields=(
+                "nextPageToken,newStartPageToken,"
+                "changes(changeType,fileId,removed,"
+                "file(id,name,mimeType,webViewLink,modifiedTime,trashed))"
+            ),
+        ).execute()
+
+        for change in response.get("changes", []):
+            file_id   = change["fileId"]
+            file_meta = change.get("file") or {}
+            removed   = change.get("removed") or file_meta.get("trashed", False)
+
+            if removed:
+                try:
+                    collection.delete(where={"file_id": file_id})
+                    logger.info("Removed deleted file %s from index", file_id)
+                except Exception:
+                    pass
+            elif file_meta:
+                try:
+                    index_file(file_meta, collection)
+                except Exception as exc:
+                    logger.error("Failed to re-index %r: %s", file_meta.get("name"), exc)
+
+            processed += 1
+
+        new_token = response.get("newStartPageToken") or response.get("nextPageToken")
+        if new_token:
+            _save_token(new_token)
+
+        # newStartPageToken signals the end of the change list
+        if response.get("newStartPageToken"):
+            break
+        token = response.get("nextPageToken")
+        if not token:
+            break
+
+    logger.info("Incremental sync complete: %d change(s) processed", processed)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Index Shared Drive files into Chroma")
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="Force a full re-index even if a changes token exists",
+    )
+    args = parser.parse_args()
+
+    collection = _get_chroma_collection()
+
+    if args.full or not os.path.exists(CHANGES_TOKEN_FILE):
+        logger.info("Starting full sync…")
+        full_sync(collection)
+    else:
+        logger.info("Starting incremental sync…")
+        incremental_sync(collection)

@@ -19,6 +19,7 @@ import os
 
 import anthropic
 
+import rag_retriever
 from drive_search import search_shared_drive
 
 logger = logging.getLogger(__name__)
@@ -42,12 +43,13 @@ def _get_client() -> anthropic.Anthropic:
 
 _TOOLS = [
     {
-        "name": "search_drive",
+        "name": "search",
         "description": (
-            "Search the Metalios Google Workspace Shared Drive for files. "
-            "You can call this tool multiple times with different search terms. "
-            "Try shorter, broader terms if an initial search returns nothing. "
-            "Try synonyms or alternate phrasings for vague questions."
+            "Search the Metalios Google Workspace Shared Drive. "
+            "Returns matching file links AND relevant content excerpts from those files. "
+            "Call this whenever the user asks to find a file OR wants to know what a document says. "
+            "You can call this tool multiple times with different search terms — "
+            "try shorter, broader terms or synonyms if the first search returns nothing."
         ),
         "input_schema": {
             "type": "object",
@@ -56,13 +58,13 @@ _TOOLS = [
                     "type": "string",
                     "description": (
                         "Keywords to search for. "
-                        "Examples: 'listing presentation', 'agent onboarding checklist', "
-                        "'Q1 budget 2024', 'team member agreement'"
+                        "Examples: 'earnest money process', 'listing presentation', "
+                        "'agent onboarding checklist', 'vendor contacts'"
                     ),
                 },
                 "max_results": {
                     "type": "integer",
-                    "description": "How many results to fetch (1–10). Default 6.",
+                    "description": "How many file results to fetch (1–10). Default 6.",
                     "default": 6,
                 },
             },
@@ -77,25 +79,31 @@ _TOOLS = [
 # ---------------------------------------------------------------------------
 
 _SYSTEM = """\
-You are a helpful file-finder assistant for the Metalios real estate team.
-Your only job is to find files in the team's Google Workspace Shared Drive.
+You are a helpful assistant for the Metalios real estate team.
+Your job is to find files in the team's Google Workspace Shared Drive and answer questions about them.
 
 Rules:
-1. Use the search_drive tool to find files. You can call it up to 4 times.
+1. Use the search tool to find files and content. You can call it up to 4 times.
 2. If the first search returns nothing or irrelevant results, try different
    keywords — shorter terms, synonyms, or the most distinctive word in the request.
-3. Once you have good results, write a concise Slack response.
+3. The search tool returns two things:
+   - "files": matching files with links (use these when the user wants to find/open a document)
+   - "content_chunks": relevant text excerpts from documents (use these to answer questions directly)
+4. If content_chunks are returned, use them to answer the question, then cite the source file.
+5. If only file links are returned (no content), share the link so the user can open it.
+6. Always include the source file link when answering from content.
 
 Slack formatting rules (mrkdwn):
 - Link files as: <URL|File Name>
 - Prefix each file with its type emoji: 📄 Doc  📊 Sheet  📋 Slides  📕 PDF  📎 File
 - Bold the question echo: *"their question"*
-- End with an italicised count: _Found X file(s) in the Shared Drive_
+- When answering from content: end with _Source: <URL|File Name>_
+- When returning file links: end with _Found X file(s) in the Shared Drive_
 - Maximum 4 files in the response — pick the most relevant ones
 - If nothing relevant is found after searching, say so clearly with
   a suggestion to use different keywords
 
-Do NOT add preamble like "Sure!" or "I found the following…" — get straight to the files.\
+Do NOT add preamble like "Sure!" or "I found the following…" — get straight to the answer or files.\
 """
 
 
@@ -148,32 +156,40 @@ def build_response(question: str, _files: list = None) -> str:
                 if block.type != "tool_use":
                     continue
 
-                if block.name == "search_drive":
+                if block.name == "search":
                     query       = block.input.get("query", question)
                     max_results = block.input.get("max_results", 6)
-                    logger.info("Agentic Drive search [round %d]: %r", rounds + 1, query)
+                    logger.info("Agentic search [round %d]: %r", rounds + 1, query)
 
+                    # Drive file search — returns file links and metadata
                     try:
                         files = search_shared_drive(query, max_results=max_results)
-                        # Give Claude the raw file metadata so it can reason about relevance
-                        result_content = json.dumps(
-                            [
-                                {
-                                    "name":     f.get("name"),
-                                    "type":     f.get("label"),
-                                    "emoji":    f.get("emoji"),
-                                    "link":     f.get("webViewLink"),
-                                    "modified": (f.get("modifiedTime") or "")[:10],
-                                }
-                                for f in files
-                            ]
-                        )
-                        if not files:
-                            result_content = "[]  # No results — try different keywords"
-
+                        file_results = [
+                            {
+                                "name":     f.get("name"),
+                                "type":     f.get("label"),
+                                "emoji":    f.get("emoji"),
+                                "link":     f.get("webViewLink"),
+                                "modified": (f.get("modifiedTime") or "")[:10],
+                            }
+                            for f in files
+                        ]
                     except Exception as exc:
                         logger.error("Drive search error: %s", exc)
-                        result_content = f"Error searching Drive: {exc}"
+                        file_results = []
+
+                    # RAG knowledge base search — returns content chunks with source links
+                    try:
+                        chunks = rag_retriever.search(query)
+                    except Exception as exc:
+                        logger.error("RAG search error: %s", exc)
+                        chunks = []
+
+                    combined = {"files": file_results, "content_chunks": chunks}
+                    if not file_results and not chunks:
+                        combined["note"] = "No results — try different keywords"
+
+                    result_content = json.dumps(combined)
 
                     tool_results.append(
                         {
