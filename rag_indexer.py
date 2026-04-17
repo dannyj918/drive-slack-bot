@@ -377,6 +377,8 @@ def incremental_sync(collection: chromadb.Collection) -> None:
             raise
 
         for change in response.get("changes", []):
+            if "fileId" not in change:
+                continue
             file_id   = change["fileId"]
             file_meta = change.get("file") or {}
             removed   = change.get("removed") or file_meta.get("trashed", False)

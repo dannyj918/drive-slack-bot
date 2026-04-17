@@ -208,6 +208,22 @@ def build_response(question: str, _files: list = None) -> str:
             # Unexpected stop reason
             break
 
+    # Rounds exhausted — give Claude one final turn to answer from accumulated results
+    try:
+        final = _get_client().messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=1024,
+            system=_SYSTEM,
+            tools=_TOOLS,
+            tool_choice={"type": "none"},
+            messages=messages,
+        )
+        for block in final.content:
+            if hasattr(block, "text"):
+                return block.text.strip()
+    except Exception as exc:
+        logger.error("Final synthesis call failed: %s", exc)
+
     return (
         f"I searched the drive several times for *\"{_escape(question)}\"* "
         "but couldn't find a confident match. "
