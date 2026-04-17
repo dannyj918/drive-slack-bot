@@ -22,6 +22,7 @@ import logging
 import os
 import sys
 import tempfile
+import time
 
 import chromadb
 import openai
@@ -206,8 +207,23 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
     embeddings: list[list[float]] = []
 
     for i in range(0, len(texts), EMBED_BATCH_SIZE):
-        batch    = texts[i : i + EMBED_BATCH_SIZE]
-        response = client.embeddings.create(model=EMBEDDING_MODEL, input=batch)
+        batch = texts[i : i + EMBED_BATCH_SIZE]
+        max_retries, delay = 3, 2.0
+        for attempt in range(max_retries):
+            try:
+                response = client.embeddings.create(model=EMBEDDING_MODEL, input=batch)
+                break
+            except openai.RateLimitError:
+                if attempt < max_retries - 1:
+                    logger.warning(
+                        "OpenAI rate limit hit — retrying in %.0fs (attempt %d/%d)",
+                        delay, attempt + 1, max_retries,
+                    )
+                    time.sleep(delay)
+                    delay *= 2
+                else:
+                    logger.error("OpenAI rate limit exceeded after %d retries", max_retries)
+                    raise
         embeddings.extend(item.embedding for item in response.data)
 
     return embeddings
@@ -225,6 +241,12 @@ def index_file(file: dict, collection: chromadb.Collection) -> int:
     """
     file_id = file["id"]
     name    = file.get("name", file_id)
+
+    # Remove stale chunks first — runs even if new text is empty, preventing orphans
+    try:
+        collection.delete(where={"file_id": file_id})
+    except Exception:
+        pass  # collection may be empty; delete(where=...) can raise if no matches
 
     text = extract_text(file)
     if not text.strip():
@@ -248,12 +270,6 @@ def index_file(file: dict, collection: chromadb.Collection) -> int:
         }
         for i in range(len(chunks))
     ]
-
-    # Remove stale chunks before upserting (handles file edits that shrink chunk count)
-    try:
-        collection.delete(where={"file_id": file_id})
-    except Exception:
-        pass  # collection may be empty; delete(where=...) can raise if no matches
 
     collection.upsert(
         ids=ids,
@@ -335,17 +351,30 @@ def incremental_sync(collection: chromadb.Collection) -> None:
 
     # The Changes API may paginate; iterate until newStartPageToken is present
     while True:
-        response = service.changes().list(
-            pageToken=token,
-            driveId=drive_id,
-            includeItemsFromAllDrives=True,
-            supportsAllDrives=True,
-            fields=(
-                "nextPageToken,newStartPageToken,"
-                "changes(changeType,fileId,removed,"
-                "file(id,name,mimeType,webViewLink,modifiedTime,trashed))"
-            ),
-        ).execute()
+        try:
+            response = service.changes().list(
+                pageToken=token,
+                driveId=drive_id,
+                includeItemsFromAllDrives=True,
+                supportsAllDrives=True,
+                fields=(
+                    "nextPageToken,newStartPageToken,"
+                    "changes(changeType,fileId,removed,"
+                    "file(id,name,mimeType,webViewLink,modifiedTime,trashed))"
+                ),
+            ).execute()
+        except HttpError as exc:
+            if exc.resp.status == 400 or "invalid" in str(exc).lower():
+                logger.warning(
+                    "Changes API token is expired or invalid (HTTP %s) — "
+                    "deleting token and falling back to full sync.",
+                    exc.resp.status,
+                )
+                if os.path.exists(CHANGES_TOKEN_FILE):
+                    os.remove(CHANGES_TOKEN_FILE)
+                full_sync(collection)
+                return
+            raise
 
         for change in response.get("changes", []):
             file_id   = change["fileId"]
@@ -363,6 +392,11 @@ def incremental_sync(collection: chromadb.Collection) -> None:
                     index_file(file_meta, collection)
                 except Exception as exc:
                     logger.error("Failed to re-index %r: %s", file_meta.get("name"), exc)
+            else:
+                logger.warning(
+                    "Skipping change for file_id=%s: no file metadata returned",
+                    file_id,
+                )
 
             processed += 1
 
