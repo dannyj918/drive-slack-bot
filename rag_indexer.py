@@ -29,6 +29,7 @@ import docx
 import openai
 import openpyxl
 import pypdf
+from bs4 import BeautifulSoup
 from pptx import Presentation
 from dotenv import load_dotenv
 from google.oauth2 import service_account
@@ -218,6 +219,23 @@ def extract_text(file: dict) -> str:
                 return "\n".join(rows)
         except Exception as exc:
             logger.warning("Office parse failed for %r: %s", name, exc)
+            return ""
+
+    if mime_type in ("text/html", "application/xhtml+xml"):
+        try:
+            request = service.files().get_media(fileId=file_id)
+            buf = io.BytesIO()
+            downloader = MediaIoBaseDownload(buf, request)
+            done = False
+            while not done:
+                _, done = downloader.next_chunk()
+            buf.seek(0)
+            soup = BeautifulSoup(buf.read(), "html.parser")
+            for tag in soup(["script", "style", "noscript"]):
+                tag.decompose()
+            return soup.get_text(separator=" ", strip=True)
+        except Exception as exc:
+            logger.warning("HTML parse failed for %r: %s", name, exc)
             return ""
 
     logger.debug("Skipping unsupported file type %s for %r", mime_type, name)
