@@ -6,8 +6,9 @@ features:
   bot_user:
     display_name: Resources
     always_online: true
-  messages_tab:
-    allow_user_direct_messages: true
+  app_home:
+    messages_tab_enabled: true
+    messages_tab_read_only_enabled: false
   assistant_view:
     assistant_description: Find files and answers from the Metalios Shared Drive. Ask a question and get a direct link — or ask about content and I'll read the doc for you.
   slash_commands:
