@@ -10,3 +10,4 @@ changes_token.txt
 .DS_Store
 **/.DS_Store
 .DS_Store
+__pycache__/ai_handler.cpython-314.pyc

@@ -110,8 +110,11 @@ Slack formatting rules (mrkdwn — strictly follow Slack syntax, NOT markdown):
 - When answering from content: end with _Source: <URL|File Name>_
 - When returning file links: end with _Found X file(s) in the Shared Drive_
 - Maximum 4 files in the response — pick the most relevant ones
-- If nothing relevant is found after searching, say so clearly with
-  a suggestion to use different keywords
+- If nothing relevant is found after searching, say so clearly. The system will
+  automatically offer the user a web search option as a fallback — you do not need
+  to mention this yourself, just indicate what you searched for and that it wasn't found.
+- If the user asks whether you can search the web, tell them: yes, if a Drive search
+  comes up empty the bot will offer to search the web for them.
 
 Do NOT add preamble like "Sure!" or "I found the following…" — get straight to the answer or files.\
 """
