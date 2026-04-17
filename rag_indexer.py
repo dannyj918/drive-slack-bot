@@ -17,11 +17,13 @@ Schedule with cron (every 30 minutes):
 """
 
 import argparse
+import html as html_module
 import io
 import logging
 import os
 import sys
 import tempfile
+from html.parser import HTMLParser
 
 import chromadb
 import openai
@@ -53,9 +55,10 @@ EMBED_BATCH_SIZE   = 100   # max texts per OpenAI embedding request
 
 _SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
-# MIME types that Drive can export as plain text
+# MIME types that Drive can export, and the export format to request.
+# Google Docs use text/html so that tables are parsed with column context preserved.
 _EXPORTABLE: dict[str, str] = {
-    "application/vnd.google-apps.document":     "text/plain",
+    "application/vnd.google-apps.document":     "text/html",
     "application/vnd.google-apps.spreadsheet":  "text/csv",
     "application/vnd.google-apps.presentation": "text/plain",
     "application/vnd.google-apps.form":         "text/plain",
@@ -95,6 +98,88 @@ def _get_chroma_collection() -> chromadb.Collection:
         name=COLLECTION_NAME,
         metadata={"hnsw:space": "cosine"},
     )
+
+
+# ---------------------------------------------------------------------------
+# HTML → plain-text with table-aware formatting
+# ---------------------------------------------------------------------------
+
+class _HTMLToText(HTMLParser):
+    """
+    Converts Google Docs HTML export to plain text.
+
+    Tables are the key case: each data row is emitted as
+    "Header1: value1 | Header2: value2 | …" so that column context
+    travels with every row into the embedding chunks.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._lines: list[str] = []
+        self._cell_buf: list[str] = []
+        self._row_cells: list[str] = []
+        self._table_headers: list[str] = []
+        self._in_cell = False
+        self._first_row = True
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "table":
+            self._table_headers = []
+            self._first_row = True
+        elif tag == "tr":
+            self._row_cells = []
+        elif tag in ("td", "th"):
+            self._in_cell = True
+            self._cell_buf = []
+        elif tag in ("p", "br", "div", "li") and not self._in_cell:
+            self._lines.append("")
+
+    def handle_endtag(self, tag):
+        if tag == "table":
+            self._lines.append("")
+        elif tag == "tr":
+            cells = [c.strip() for c in self._row_cells]
+            if self._first_row:
+                # Treat the first row as headers regardless of th/td
+                self._table_headers = cells
+                self._lines.append(" | ".join(cells))
+                self._first_row = False
+            else:
+                if self._table_headers and len(self._table_headers) == len(cells):
+                    row = " | ".join(
+                        f"{h}: {v}" for h, v in zip(self._table_headers, cells)
+                    )
+                else:
+                    row = " | ".join(cells)
+                self._lines.append(row)
+        elif tag in ("td", "th"):
+            self._in_cell = False
+            self._row_cells.append("".join(self._cell_buf))
+
+    def handle_data(self, data):
+        if self._in_cell:
+            self._cell_buf.append(data)
+        else:
+            stripped = data.strip()
+            if stripped:
+                self._lines.append(stripped)
+
+    def handle_entityref(self, name):
+        char = html_module.unescape(f"&{name};")
+        (self._cell_buf if self._in_cell else self._lines).append(char)
+
+    def handle_charref(self, name):
+        char = html_module.unescape(f"&#{name};")
+        (self._cell_buf if self._in_cell else self._lines).append(char)
+
+    def get_text(self) -> str:
+        return "\n".join(self._lines)
+
+
+def _html_to_text(raw_html: str) -> str:
+    parser = _HTMLToText()
+    parser.feed(raw_html)
+    return parser.get_text()
 
 
 # ---------------------------------------------------------------------------
@@ -148,12 +233,16 @@ def extract_text(file: dict) -> str:
     name      = file.get("name", file_id)
 
     if mime_type in _EXPORTABLE:
+        export_mime = _EXPORTABLE[mime_type]
         try:
             data = service.files().export(
                 fileId=file_id,
-                mimeType=_EXPORTABLE[mime_type],
+                mimeType=export_mime,
             ).execute()
-            return data.decode("utf-8", errors="ignore") if isinstance(data, bytes) else str(data)
+            raw = data.decode("utf-8", errors="ignore") if isinstance(data, bytes) else str(data)
+            if export_mime == "text/html":
+                return _html_to_text(raw)
+            return raw
         except HttpError as exc:
             logger.warning("Export failed for %r: %s", name, exc)
             return ""
