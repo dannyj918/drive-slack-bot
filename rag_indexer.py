@@ -24,6 +24,8 @@ import sys
 import tempfile
 import time
 
+import anthropic
+import base64
 import chromadb
 import docx
 import openai
@@ -179,8 +181,32 @@ def extract_text(file: dict) -> str:
             )
             return text
         except Exception as exc:
-            logger.warning("PDF parse failed for %r: %s", name, exc)
-            return ""
+            logger.warning("PDF parse failed for %r: %s — trying Claude fallback", name, exc)
+            try:
+                buf.seek(0)
+                pdf_b64 = base64.standard_b64encode(buf.read()).decode()
+                ai = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+                msg = ai.messages.create(
+                    model=os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6"),
+                    max_tokens=8096,
+                    messages=[{
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "document",
+                                "source": {"type": "base64", "media_type": "application/pdf", "data": pdf_b64},
+                            },
+                            {"type": "text", "text": "Extract and return all text content from this PDF. Return only the extracted text with no commentary."},
+                        ],
+                    }],
+                )
+                text = msg.content[0].text if msg.content else ""
+                if text:
+                    logger.info("Claude fallback succeeded for %r", name)
+                return text
+            except Exception as fb_exc:
+                logger.warning("Claude fallback also failed for %r: %s", name, fb_exc)
+                return ""
 
     # Microsoft Office formats uploaded to Drive
     _OFFICE_TYPES = {
