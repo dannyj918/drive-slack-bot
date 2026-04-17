@@ -463,6 +463,26 @@ def incremental_sync(collection: chromadb.Collection) -> None:
 # Entry point
 # ---------------------------------------------------------------------------
 
+def print_stats() -> None:
+    db_path = os.environ.get("CHROMA_DB_PATH", "./chroma_db")
+    if not os.path.exists(db_path):
+        print(f"No Chroma DB found at {db_path} — run rag_indexer.py to build the index")
+        return
+
+    collection = _get_chroma_collection()
+    chunk_count = collection.count()
+
+    total_bytes = sum(
+        os.path.getsize(os.path.join(root, f))
+        for root, _, files in os.walk(db_path)
+        for f in files
+    )
+    size_mb = total_bytes / (1024 * 1024)
+
+    print(f"Chunks : {chunk_count:,}")
+    print(f"DB size: {size_mb:.1f} MB  ({db_path})")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Index Shared Drive files into Chroma")
     parser.add_argument(
@@ -470,7 +490,16 @@ if __name__ == "__main__":
         action="store_true",
         help="Force a full re-index even if a changes token exists",
     )
+    parser.add_argument(
+        "--stats",
+        action="store_true",
+        help="Print vector DB stats (chunk count, disk size) and exit",
+    )
     args = parser.parse_args()
+
+    if args.stats:
+        print_stats()
+        sys.exit(0)
 
     collection = _get_chroma_collection()
 
