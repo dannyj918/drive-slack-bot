@@ -16,6 +16,7 @@ Model: claude-sonnet-4-6  (better reasoning for ambiguous queries)
 import json
 import logging
 import os
+from dataclasses import dataclass
 
 import anthropic
 
@@ -25,6 +26,12 @@ from drive_search import search_shared_drive
 logger = logging.getLogger(__name__)
 
 _client: anthropic.Anthropic | None = None
+
+
+@dataclass
+class SearchResult:
+    text: str
+    no_results: bool = False
 
 MAX_SEARCH_ROUNDS = 4   # Claude can call search_drive up to this many times
 CLAUDE_MODEL      = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-5")
@@ -114,7 +121,7 @@ Do NOT add preamble like "Sure!" or "I found the following…" — get straight 
 # Public entry point
 # ---------------------------------------------------------------------------
 
-def build_response(question: str, _files: list = None, history: list = None) -> str:
+def build_response(question: str, _files: list = None, history: list = None) -> SearchResult:
     """
     Run an agentic search loop: Claude decides what to search for,
     calls search_drive as many times as it needs, and returns a
@@ -148,8 +155,8 @@ def build_response(question: str, _files: list = None, history: list = None) -> 
         if response.stop_reason == "end_turn":
             for block in response.content:
                 if hasattr(block, "text"):
-                    return block.text.strip()
-            return "I searched the drive but couldn't put together a response. Please try again."
+                    return SearchResult(block.text.strip())
+            return SearchResult("I searched the drive but couldn't put together a response. Please try again.")
 
         # Claude wants to call a tool
         if response.stop_reason == "tool_use":
@@ -223,15 +230,40 @@ def build_response(question: str, _files: list = None, history: list = None) -> 
         )
         for block in final.content:
             if hasattr(block, "text"):
-                return block.text.strip()
+                return SearchResult(block.text.strip())
     except Exception as exc:
         logger.error("Final synthesis call failed: %s", exc)
 
-    return (
+    return SearchResult(
         f"I searched the drive several times for *\"{_escape(question)}\"* "
         "but couldn't find a confident match. "
-        "Try rephrasing with the document's specific title or type."
+        "Try rephrasing with the document's specific title or type.",
+        no_results=True,
     )
+
+
+def build_web_response(question: str) -> str:
+    """Search the web via Claude's built-in web_search tool and return a Slack-formatted answer."""
+    try:
+        response = _get_client().messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=1024,
+            system=(
+                "You are a helpful assistant. Use the web_search tool to find relevant "
+                "information for the user's question. Return a concise answer with "
+                "source links formatted as Slack mrkdwn: *<url|Title>*. "
+                "List up to 5 sources. Use bullet points. "
+                "Use *single asterisks* for bold, NEVER **double asterisks**."
+            ),
+            tools=[{"type": "web_search_20250305"}],
+            messages=[{"role": "user", "content": question}],
+        )
+        for block in response.content:
+            if hasattr(block, "text"):
+                return block.text.strip()
+    except Exception as exc:
+        logger.error("Web search call failed: %s", exc)
+    return "I searched the web but couldn't find a useful answer. Try rephrasing your question."
 
 
 def _escape(text: str) -> str:
