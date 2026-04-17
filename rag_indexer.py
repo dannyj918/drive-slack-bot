@@ -258,7 +258,7 @@ def extract_text(file: dict) -> str:
                 _, done = downloader.next_chunk()
             buf.seek(0)
             soup = BeautifulSoup(buf.read(), "html.parser")
-            for tag in soup(["script", "style", "noscript"]):
+            for tag in soup(["style", "noscript"]):
                 tag.decompose()
             return soup.get_text(separator=" ", strip=True)
         except Exception as exc:
