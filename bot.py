@@ -80,6 +80,7 @@ def handle_help(ack, respond, command, client):
     client.chat_postMessage(
         channel=dm_channel,
         text=f"Results for `/help {question}`:\n\n{response_text}\n\n_Reply here to follow up._",
+        mrkdwn=True,
     )
 
 

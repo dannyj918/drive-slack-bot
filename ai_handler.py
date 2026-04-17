@@ -93,7 +93,10 @@ Rules:
 5. If only file links are returned (no content), share the link so the user can open it.
 6. Always include the source file link when answering from content.
 
-Slack formatting rules (mrkdwn):
+Slack formatting rules (mrkdwn — strictly follow Slack syntax, NOT markdown):
+- Use *single asterisks* for bold, NEVER **double asterisks**
+- Use _underscores_ for italics
+- Use bullet lists with a leading • character (Unicode bullet), or start lines with - followed by a space
 - Link files as: <URL|File Name>
 - Prefix each file with its type emoji: 📄 Doc  📊 Sheet  📋 Slides  📕 PDF  📎 File
 - Bold the question echo: *"their question"*
