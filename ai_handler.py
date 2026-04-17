@@ -111,7 +111,7 @@ Do NOT add preamble like "Sure!" or "I found the following…" — get straight 
 # Public entry point
 # ---------------------------------------------------------------------------
 
-def build_response(question: str, _files: list = None) -> str:
+def build_response(question: str, _files: list = None, history: list = None) -> str:
     """
     Run an agentic search loop: Claude decides what to search for,
     calls search_drive as many times as it needs, and returns a
@@ -120,7 +120,7 @@ def build_response(question: str, _files: list = None) -> str:
     The `_files` parameter is accepted for compatibility but ignored —
     the agentic loop does its own searching.
     """
-    messages = [
+    messages = (history or []) + [
         {
             "role": "user",
             "content": (

@@ -30,6 +30,7 @@ from dotenv import load_dotenv
 
 from drive_search import search_shared_drive
 from ai_handler import build_response
+from conversation import fetch_thread_history
 
 load_dotenv()
 
@@ -51,16 +52,17 @@ app = App(token=os.environ["SLACK_BOT_TOKEN"])
 # ---------------------------------------------------------------------------
 
 @app.command("/help")
-def handle_help(ack, respond, command):
+def handle_help(ack, respond, command, client):
     ack()
     question = command.get("text", "").strip()
+    user_id  = command["user_id"]
 
     if not question:
         respond(
             response_type="ephemeral",
             text=(
                 "🔍 *What are you looking for?*\n"
-                "Type `/help` followed by your question — only you'll see the results:\n\n"
+                "Type `/help` followed by your question — I'll DM you the results so you can follow up:\n\n"
                 "> `/help find the Q1 budget template`\n"
                 "> `/help listing presentation deck`\n"
                 "> `/help agent onboarding checklist`"
@@ -68,10 +70,17 @@ def handle_help(ack, respond, command):
         )
         return
 
-    # Run the search — response is ephemeral so only the asker sees it
-    respond(response_type="ephemeral", text="🔍 Searching the drive…")
+    # Acknowledge in-channel (ephemeral), then send the real result to the user's DM
+    # so they can continue the conversation by replying there.
+    respond(response_type="ephemeral", text="🔍 Searching the drive… I'll send the results to your DMs.")
     response_text = _search_and_respond(question)
-    respond(response_type="ephemeral", text=response_text)
+
+    dm = client.conversations_open(users=user_id)
+    dm_channel = dm["channel"]["id"]
+    client.chat_postMessage(
+        channel=dm_channel,
+        text=f"Results for `/help {question}`:\n\n{response_text}\n\n_Reply here to follow up._",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -123,11 +132,11 @@ def handle_app_mention(event, say, client):
     say(text=response_text, channel=channel, thread_ts=thread_ts)
 
 
-def _search_and_respond(question: str) -> str:
+def _search_and_respond(question: str, history: list = None) -> str:
     """Run the Drive search and format a Slack-ready response."""
     try:
         files = search_shared_drive(question)
-        return build_response(question, files)
+        return build_response(question, files, history=history)
     except Exception as e:
         logger.error("Error during drive search: %s", e, exc_info=True)
         return (
@@ -176,14 +185,17 @@ def handle_dm(event, say, client):
         )
         return
 
-    logger.info("DM Drive search | user=%s | query=%r", user_id, question)
+    thread_ts = event.get("thread_ts")
+    history   = fetch_thread_history(client, channel, thread_ts) if thread_ts else None
+
+    logger.info("DM Drive search | user=%s | query=%r | thread=%s", user_id, question, bool(thread_ts))
 
     try:
         client.reactions_add(channel=channel, name="eyes", timestamp=event_ts)
     except Exception:
         pass
 
-    response_text = _search_and_respond(question)
+    response_text = _search_and_respond(question, history=history)
 
     try:
         client.reactions_remove(channel=channel, name="eyes", timestamp=event_ts)
@@ -191,8 +203,7 @@ def handle_dm(event, say, client):
     except Exception:
         pass
 
-    # DMs don't use thread_ts — just reply directly
-    say(text=response_text, channel=channel)
+    say(text=response_text, channel=channel, **( {"thread_ts": thread_ts} if thread_ts else {} ))
 
 
 # ---------------------------------------------------------------------------
