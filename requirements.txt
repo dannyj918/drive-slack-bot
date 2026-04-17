@@ -19,6 +19,9 @@ openai>=1.30.0
 # RAG — vector store + PDF parsing
 chromadb>=0.5.0
 pypdf>=4.0.0
+python-pptx>=0.6.23          # .pptx files
+python-docx>=1.1.0           # .docx files
+openpyxl>=3.1.0              # .xlsx files
 
 # Utilities
 python-dotenv>=1.0.0        # Loads .env file automatically

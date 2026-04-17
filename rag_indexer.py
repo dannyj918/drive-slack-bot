@@ -25,8 +25,11 @@ import tempfile
 import time
 
 import chromadb
+import docx
 import openai
+import openpyxl
 import pypdf
+from pptx import Presentation
 from dotenv import load_dotenv
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -175,6 +178,46 @@ def extract_text(file: dict) -> str:
             return text
         except Exception as exc:
             logger.warning("PDF parse failed for %r: %s", name, exc)
+            return ""
+
+    # Microsoft Office formats uploaded to Drive
+    _OFFICE_TYPES = {
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation": "pptx",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document":   "docx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":         "xlsx",
+    }
+    if mime_type in _OFFICE_TYPES:
+        try:
+            request = service.files().get_media(fileId=file_id)
+            buf = io.BytesIO()
+            downloader = MediaIoBaseDownload(buf, request)
+            done = False
+            while not done:
+                _, done = downloader.next_chunk()
+            buf.seek(0)
+            fmt = _OFFICE_TYPES[mime_type]
+            if fmt == "pptx":
+                prs = Presentation(buf)
+                parts = []
+                for slide in prs.slides:
+                    for shape in slide.shapes:
+                        if shape.has_text_frame:
+                            parts.append(shape.text_frame.text)
+                return "\n".join(parts)
+            if fmt == "docx":
+                doc = docx.Document(buf)
+                return "\n".join(p.text for p in doc.paragraphs)
+            if fmt == "xlsx":
+                wb = openpyxl.load_workbook(buf, read_only=True, data_only=True)
+                rows = []
+                for sheet in wb.worksheets:
+                    for row in sheet.iter_rows(values_only=True):
+                        line = "\t".join("" if v is None else str(v) for v in row)
+                        if line.strip():
+                            rows.append(line)
+                return "\n".join(rows)
+        except Exception as exc:
+            logger.warning("Office parse failed for %r: %s", name, exc)
             return ""
 
     logger.debug("Skipping unsupported file type %s for %r", mime_type, name)
