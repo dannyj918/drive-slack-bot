@@ -479,6 +479,23 @@ def incremental_sync(collection: chromadb.Collection) -> None:
                     pass
             elif file_meta:
                 try:
+                    incoming_modified = (file_meta.get("modifiedTime") or "")[:10]
+                    if incoming_modified:
+                        existing = collection.get(
+                            where={"file_id": file_id},
+                            limit=1,
+                            include=["metadatas"],
+                        )
+                        if (
+                            existing["metadatas"]
+                            and existing["metadatas"][0].get("modified_time") == incoming_modified
+                        ):
+                            logger.debug(
+                                "Skipping %r — modifiedTime unchanged (%s)",
+                                file_meta.get("name"), incoming_modified,
+                            )
+                            processed += 1
+                            continue
                     index_file(file_meta, collection)
                 except Exception as exc:
                     logger.error("Failed to re-index %r: %s", file_meta.get("name"), exc)
