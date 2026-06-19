@@ -1,0 +1,12 @@
+.env
+.env.*
+!.env.example
+.venv
+__pycache__
+*.pyc
+.git
+chroma_db/
+changes_token.txt
+service_account.json
+*.json
+!slack_manifest.yaml
