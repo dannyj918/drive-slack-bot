@@ -1,7 +1,7 @@
 # Slack Drive Bot — Setup Guide
 
 This bot lets Metalios team members find Google Drive files by asking natural
-language questions in Slack. It uses Claude Sonnet 4.5 to intelligently interpret
+language questions in Slack. It uses Claude Sonnet 4.6 to intelligently interpret
 vague or imprecise questions, running multiple Drive searches until it finds the
 right files — even when team members can't quite describe what they're looking for.
 
@@ -103,7 +103,7 @@ Optional:
 
 | Variable | Default | Notes |
 |---|---|---|
-| `CLAUDE_MODEL` | `claude-sonnet-4-5` | Swap to `claude-haiku-4-5-20251001` for faster/cheaper responses |
+| `CLAUDE_MODEL` | `claude-sonnet-4-6` | Swap to `claude-haiku-4-5-20251001` for faster/cheaper responses |
 
 ---
 
@@ -150,6 +150,9 @@ It handles vague questions well — e.g. *"that onboarding thing"* or *"the Smit
 ## Running in Production
 
 For a long-lived deployment, run the bot as a background process or system service.
+
+**Cloud deploy (recommended — no local machine needed):** See [DEPLOY.md](DEPLOY.md) for
+Fly.io, Railway, Render, and VPS instructions with Docker.
 
 **Using `nohup` (quick and dirty):**
 ```bash
@@ -208,7 +211,7 @@ CMD ["python", "bot.py"]
 slack_drive_bot/
 ├── bot.py               ← Slack Socket Mode app & event handlers
 ├── drive_search.py      ← Google Drive API search (service account)
-├── ai_handler.py        ← Claude Sonnet 4.5 — agentic search loop & response formatting
+├── ai_handler.py        ← Claude Sonnet 4.6 — agentic search loop & response formatting
 ├── requirements.txt     ← Python dependencies
 ├── slack_manifest.yaml  ← Paste into api.slack.com to auto-configure the Slack app
 ├── .env.example         ← Copy to .env and fill in your values

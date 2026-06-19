@@ -21,12 +21,9 @@ from typing import Optional
 
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from google.oauth2 import service_account
+from google_credentials import get_drive_credentials
 
 logger = logging.getLogger(__name__)
-
-# Read-only access is all we need
-_SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
 # Emoji + label for known MIME types
 _MIME_META: dict[str, tuple[str, str]] = {
@@ -45,10 +42,7 @@ _MIME_META: dict[str, tuple[str, str]] = {
 
 def _build_service():
     """Create an authenticated Drive v3 service using the service account."""
-    key_file = os.environ.get("GOOGLE_SERVICE_ACCOUNT_FILE", "service_account.json")
-    creds = service_account.Credentials.from_service_account_file(
-        key_file, scopes=_SCOPES
-    )
+    creds = get_drive_credentials()
     # cache_discovery=False avoids stale discovery doc issues in long-running processes
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 

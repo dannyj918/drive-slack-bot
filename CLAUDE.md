@@ -48,6 +48,12 @@ All secrets in `.env` (gitignored). See `.env.example` for the template.
 | `SHARED_DRIVE_ID` | yes | — | Google Shared Drive ID |
 | `CLAUDE_MODEL` | no | `claude-sonnet-4-5` | Override the Claude model |
 | `CHROMA_DB_PATH` | no | `./chroma_db` | Chroma vector DB path |
+| `ANTHROPIC_API_KEY` | yes | — | Anthropic console API key |
+| `OPENAI_API_KEY` | yes (for RAG) | — | OpenAI key for `text-embedding-3-small` embeddings |
+| `GOOGLE_SERVICE_ACCOUNT_FILE` | yes | `service_account.json` | Path to service account JSON key |
+| `SHARED_DRIVE_ID` | yes | — | Google Shared Drive ID (from the drive URL) |
+| `CLAUDE_MODEL` | no | `claude-sonnet-4-6` | Swap to `claude-haiku-4-5-20251001` for speed/cost |
+| `CHROMA_DB_PATH` | no | `./chroma_db` | Where Chroma persists the vector DB on disk |
 
 The service account JSON is gitignored — place it manually.
 
@@ -116,6 +122,11 @@ rag_indexer.py
 **Google Drive:** Service account with `drive.readonly` scope. Single Shared Drive searched via Drive API v3.
 
 **Anthropic Claude:** Tool use (function calling) with a single `search` tool. Default model `claude-sonnet-4-5`; Haiku is faster/cheaper for simple lookups.
+### Anthropic Claude
+- Uses the `anthropic` SDK with tool use (function calling)
+- Default model: `claude-sonnet-4-6`; configurable via `CLAUDE_MODEL`
+- `max_tokens=1024` per request — sufficient for Slack responses
+- Client is a lazy singleton (`_client` global in `ai_handler.py`)
 
 ---
 

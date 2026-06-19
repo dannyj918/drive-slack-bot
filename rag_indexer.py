@@ -34,7 +34,7 @@ import pypdf
 from bs4 import BeautifulSoup
 from pptx import Presentation
 from dotenv import load_dotenv
-from google.oauth2 import service_account
+from google_credentials import get_drive_credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload
@@ -54,12 +54,10 @@ logger = logging.getLogger(__name__)
 
 EMBEDDING_MODEL    = "text-embedding-3-small"
 COLLECTION_NAME    = "drive_docs"
-CHANGES_TOKEN_FILE = "changes_token.txt"
+CHANGES_TOKEN_FILE = os.environ.get("CHANGES_TOKEN_FILE", "changes_token.txt")
 CHUNK_SIZE         = 500   # words per chunk
 CHUNK_OVERLAP      = 50    # word overlap between chunks
 EMBED_BATCH_SIZE   = 100   # max texts per OpenAI embedding request
-
-_SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
 # MIME types that Drive can export as plain text
 _EXPORTABLE: dict[str, str] = {
@@ -81,10 +79,7 @@ def _build_drive_service():
     global _drive_service
     if _drive_service is not None:
         return _drive_service
-    key_file = os.environ.get("GOOGLE_SERVICE_ACCOUNT_FILE", "service_account.json")
-    creds = service_account.Credentials.from_service_account_file(
-        key_file, scopes=_SCOPES
-    )
+    creds = get_drive_credentials()
     _drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
     return _drive_service
 
