@@ -23,6 +23,8 @@ Run:
 import os
 import re
 import logging
+import threading
+import time
 
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
@@ -31,6 +33,7 @@ from dotenv import load_dotenv
 from drive_search import search_shared_drive
 from ai_handler import build_response, build_web_response, SearchResult
 from conversation import fetch_thread_history
+from rag_indexer import full_sync, incremental_sync, _get_chroma_collection, CHANGES_TOKEN_FILE
 
 load_dotenv()
 
@@ -39,6 +42,9 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+# How often to re-sync the RAG index against Drive changes, in seconds.
+RAG_INDEX_INTERVAL_SECONDS = int(os.environ.get("RAG_INDEX_INTERVAL_SECONDS", 3600))
 
 # ---------------------------------------------------------------------------
 # Slack app
@@ -293,10 +299,29 @@ def handle_web_search_decline(ack, body, client):
 
 
 # ---------------------------------------------------------------------------
+# Background RAG re-indexing — runs in the same process so it shares the
+# /data volume mount with the bot, instead of needing a separate service.
+# ---------------------------------------------------------------------------
+
+def _run_periodic_indexing():
+    collection = _get_chroma_collection()
+    while True:
+        try:
+            if os.path.exists(CHANGES_TOKEN_FILE):
+                incremental_sync(collection)
+            else:
+                full_sync(collection)
+        except Exception:
+            logger.error("RAG index sync failed", exc_info=True)
+        time.sleep(RAG_INDEX_INTERVAL_SECONDS)
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     logger.info("Starting Slack Drive Bot (Socket Mode)…")
+    threading.Thread(target=_run_periodic_indexing, daemon=True, name="rag-indexer").start()
     handler = SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"])
     handler.start()
