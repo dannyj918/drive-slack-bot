@@ -22,10 +22,17 @@ import logging
 import os
 import sys
 import tempfile
+import time
 
+import anthropic
+import base64
 import chromadb
+import docx
 import openai
+import openpyxl
 import pypdf
+from bs4 import BeautifulSoup
+from pptx import Presentation
 from dotenv import load_dotenv
 from google_credentials import get_drive_credentials
 from googleapiclient.discovery import build
@@ -38,6 +45,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
+logging.getLogger("pypdf").setLevel(logging.ERROR)
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -168,7 +176,88 @@ def extract_text(file: dict) -> str:
             )
             return text
         except Exception as exc:
-            logger.warning("PDF parse failed for %r: %s", name, exc)
+            logger.warning("PDF parse failed for %r: %s — trying Claude fallback", name, exc)
+            try:
+                buf.seek(0)
+                pdf_b64 = base64.standard_b64encode(buf.read()).decode()
+                ai = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+                msg = ai.messages.create(
+                    model=os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6"),
+                    max_tokens=8096,
+                    messages=[{
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "document",
+                                "source": {"type": "base64", "media_type": "application/pdf", "data": pdf_b64},
+                            },
+                            {"type": "text", "text": "Extract and return all text content from this PDF. Return only the extracted text with no commentary."},
+                        ],
+                    }],
+                )
+                text = msg.content[0].text if msg.content else ""
+                if text:
+                    logger.info("Claude fallback succeeded for %r", name)
+                return text
+            except Exception as fb_exc:
+                logger.warning("Claude fallback also failed for %r: %s", name, fb_exc)
+                return ""
+
+    # Microsoft Office formats uploaded to Drive
+    _OFFICE_TYPES = {
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation": "pptx",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document":   "docx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":         "xlsx",
+    }
+    if mime_type in _OFFICE_TYPES:
+        try:
+            request = service.files().get_media(fileId=file_id)
+            buf = io.BytesIO()
+            downloader = MediaIoBaseDownload(buf, request)
+            done = False
+            while not done:
+                _, done = downloader.next_chunk()
+            buf.seek(0)
+            fmt = _OFFICE_TYPES[mime_type]
+            if fmt == "pptx":
+                prs = Presentation(buf)
+                parts = []
+                for slide in prs.slides:
+                    for shape in slide.shapes:
+                        if shape.has_text_frame:
+                            parts.append(shape.text_frame.text)
+                return "\n".join(parts)
+            if fmt == "docx":
+                doc = docx.Document(buf)
+                return "\n".join(p.text for p in doc.paragraphs)
+            if fmt == "xlsx":
+                wb = openpyxl.load_workbook(buf, read_only=True, data_only=True)
+                rows = []
+                for sheet in wb.worksheets:
+                    for row in sheet.iter_rows(values_only=True):
+                        line = "\t".join("" if v is None else str(v) for v in row)
+                        if line.strip():
+                            rows.append(line)
+                return "\n".join(rows)
+        except Exception as exc:
+            logger.warning("Office parse failed for %r: %s", name, exc)
+            return ""
+
+    if mime_type in ("text/html", "application/xhtml+xml"):
+        try:
+            request = service.files().get_media(fileId=file_id)
+            buf = io.BytesIO()
+            downloader = MediaIoBaseDownload(buf, request)
+            done = False
+            while not done:
+                _, done = downloader.next_chunk()
+            buf.seek(0)
+            soup = BeautifulSoup(buf.read(), "html.parser")
+            for tag in soup(["style", "noscript"]):
+                tag.decompose()
+            return soup.get_text(separator=" ", strip=True)
+        except Exception as exc:
+            logger.warning("HTML parse failed for %r: %s", name, exc)
             return ""
 
     logger.debug("Skipping unsupported file type %s for %r", mime_type, name)
@@ -201,8 +290,23 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
     embeddings: list[list[float]] = []
 
     for i in range(0, len(texts), EMBED_BATCH_SIZE):
-        batch    = texts[i : i + EMBED_BATCH_SIZE]
-        response = client.embeddings.create(model=EMBEDDING_MODEL, input=batch)
+        batch = texts[i : i + EMBED_BATCH_SIZE]
+        max_retries, delay = 3, 2.0
+        for attempt in range(max_retries):
+            try:
+                response = client.embeddings.create(model=EMBEDDING_MODEL, input=batch)
+                break
+            except openai.RateLimitError:
+                if attempt < max_retries - 1:
+                    logger.warning(
+                        "OpenAI rate limit hit — retrying in %.0fs (attempt %d/%d)",
+                        delay, attempt + 1, max_retries,
+                    )
+                    time.sleep(delay)
+                    delay *= 2
+                else:
+                    logger.error("OpenAI rate limit exceeded after %d retries", max_retries)
+                    raise
         embeddings.extend(item.embedding for item in response.data)
 
     return embeddings
@@ -220,6 +324,12 @@ def index_file(file: dict, collection: chromadb.Collection) -> int:
     """
     file_id = file["id"]
     name    = file.get("name", file_id)
+
+    # Remove stale chunks first — runs even if new text is empty, preventing orphans
+    try:
+        collection.delete(where={"file_id": file_id})
+    except Exception:
+        pass  # collection may be empty; delete(where=...) can raise if no matches
 
     text = extract_text(file)
     if not text.strip():
@@ -243,12 +353,6 @@ def index_file(file: dict, collection: chromadb.Collection) -> int:
         }
         for i in range(len(chunks))
     ]
-
-    # Remove stale chunks before upserting (handles file edits that shrink chunk count)
-    try:
-        collection.delete(where={"file_id": file_id})
-    except Exception:
-        pass  # collection may be empty; delete(where=...) can raise if no matches
 
     collection.upsert(
         ids=ids,
@@ -330,19 +434,34 @@ def incremental_sync(collection: chromadb.Collection) -> None:
 
     # The Changes API may paginate; iterate until newStartPageToken is present
     while True:
-        response = service.changes().list(
-            pageToken=token,
-            driveId=drive_id,
-            includeItemsFromAllDrives=True,
-            supportsAllDrives=True,
-            fields=(
-                "nextPageToken,newStartPageToken,"
-                "changes(changeType,fileId,removed,"
-                "file(id,name,mimeType,webViewLink,modifiedTime,trashed))"
-            ),
-        ).execute()
+        try:
+            response = service.changes().list(
+                pageToken=token,
+                driveId=drive_id,
+                includeItemsFromAllDrives=True,
+                supportsAllDrives=True,
+                fields=(
+                    "nextPageToken,newStartPageToken,"
+                    "changes(changeType,fileId,removed,"
+                    "file(id,name,mimeType,webViewLink,modifiedTime,trashed))"
+                ),
+            ).execute()
+        except HttpError as exc:
+            if exc.resp.status == 400 or "invalid" in str(exc).lower():
+                logger.warning(
+                    "Changes API token is expired or invalid (HTTP %s) — "
+                    "deleting token and falling back to full sync.",
+                    exc.resp.status,
+                )
+                if os.path.exists(CHANGES_TOKEN_FILE):
+                    os.remove(CHANGES_TOKEN_FILE)
+                full_sync(collection)
+                return
+            raise
 
         for change in response.get("changes", []):
+            if "fileId" not in change:
+                continue
             file_id   = change["fileId"]
             file_meta = change.get("file") or {}
             removed   = change.get("removed") or file_meta.get("trashed", False)
@@ -355,9 +474,31 @@ def incremental_sync(collection: chromadb.Collection) -> None:
                     pass
             elif file_meta:
                 try:
+                    incoming_modified = (file_meta.get("modifiedTime") or "")[:10]
+                    if incoming_modified:
+                        existing = collection.get(
+                            where={"file_id": file_id},
+                            limit=1,
+                            include=["metadatas"],
+                        )
+                        if (
+                            existing["metadatas"]
+                            and existing["metadatas"][0].get("modified_time") == incoming_modified
+                        ):
+                            logger.debug(
+                                "Skipping %r — modifiedTime unchanged (%s)",
+                                file_meta.get("name"), incoming_modified,
+                            )
+                            processed += 1
+                            continue
                     index_file(file_meta, collection)
                 except Exception as exc:
                     logger.error("Failed to re-index %r: %s", file_meta.get("name"), exc)
+            else:
+                logger.warning(
+                    "Skipping change for file_id=%s: no file metadata returned",
+                    file_id,
+                )
 
             processed += 1
 
@@ -379,6 +520,26 @@ def incremental_sync(collection: chromadb.Collection) -> None:
 # Entry point
 # ---------------------------------------------------------------------------
 
+def print_stats() -> None:
+    db_path = os.environ.get("CHROMA_DB_PATH", "./chroma_db")
+    if not os.path.exists(db_path):
+        print(f"No Chroma DB found at {db_path} — run rag_indexer.py to build the index")
+        return
+
+    collection = _get_chroma_collection()
+    chunk_count = collection.count()
+
+    total_bytes = sum(
+        os.path.getsize(os.path.join(root, f))
+        for root, _, files in os.walk(db_path)
+        for f in files
+    )
+    size_mb = total_bytes / (1024 * 1024)
+
+    print(f"Chunks : {chunk_count:,}")
+    print(f"DB size: {size_mb:.1f} MB  ({db_path})")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Index Shared Drive files into Chroma")
     parser.add_argument(
@@ -386,7 +547,16 @@ if __name__ == "__main__":
         action="store_true",
         help="Force a full re-index even if a changes token exists",
     )
+    parser.add_argument(
+        "--stats",
+        action="store_true",
+        help="Print vector DB stats (chunk count, disk size) and exit",
+    )
     args = parser.parse_args()
+
+    if args.stats:
+        print_stats()
+        sys.exit(0)
 
     collection = _get_chroma_collection()
 

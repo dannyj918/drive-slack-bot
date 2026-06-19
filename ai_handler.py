@@ -16,6 +16,7 @@ Model: claude-sonnet-4-6  (better reasoning for ambiguous queries)
 import json
 import logging
 import os
+from dataclasses import dataclass
 
 import anthropic
 
@@ -25,6 +26,12 @@ from drive_search import search_shared_drive
 logger = logging.getLogger(__name__)
 
 _client: anthropic.Anthropic | None = None
+
+
+@dataclass
+class SearchResult:
+    text: str
+    no_results: bool = False
 
 MAX_SEARCH_ROUNDS = 4   # Claude can call search_drive up to this many times
 CLAUDE_MODEL      = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
@@ -93,15 +100,21 @@ Rules:
 5. If only file links are returned (no content), share the link so the user can open it.
 6. Always include the source file link when answering from content.
 
-Slack formatting rules (mrkdwn):
+Slack formatting rules (mrkdwn — strictly follow Slack syntax, NOT markdown):
+- Use *single asterisks* for bold, NEVER **double asterisks**
+- Use _underscores_ for italics
+- Use bullet lists with a leading • character (Unicode bullet), or start lines with - followed by a space
 - Link files as: <URL|File Name>
 - Prefix each file with its type emoji: 📄 Doc  📊 Sheet  📋 Slides  📕 PDF  📎 File
 - Bold the question echo: *"their question"*
 - When answering from content: end with _Source: <URL|File Name>_
 - When returning file links: end with _Found X file(s) in the Shared Drive_
 - Maximum 4 files in the response — pick the most relevant ones
-- If nothing relevant is found after searching, say so clearly with
-  a suggestion to use different keywords
+- If nothing relevant is found after searching, say so clearly. The system will
+  automatically offer the user a web search option as a fallback — you do not need
+  to mention this yourself, just indicate what you searched for and that it wasn't found.
+- If the user asks whether you can search the web, tell them: yes, if a Drive search
+  comes up empty the bot will offer to search the web for them.
 
 Do NOT add preamble like "Sure!" or "I found the following…" — get straight to the answer or files.\
 """
@@ -111,7 +124,7 @@ Do NOT add preamble like "Sure!" or "I found the following…" — get straight 
 # Public entry point
 # ---------------------------------------------------------------------------
 
-def build_response(question: str, _files: list = None) -> str:
+def build_response(question: str, _files: list = None, history: list = None) -> SearchResult:
     """
     Run an agentic search loop: Claude decides what to search for,
     calls search_drive as many times as it needs, and returns a
@@ -120,7 +133,7 @@ def build_response(question: str, _files: list = None) -> str:
     The `_files` parameter is accepted for compatibility but ignored —
     the agentic loop does its own searching.
     """
-    messages = [
+    messages = (history or []) + [
         {
             "role": "user",
             "content": (
@@ -145,8 +158,8 @@ def build_response(question: str, _files: list = None) -> str:
         if response.stop_reason == "end_turn":
             for block in response.content:
                 if hasattr(block, "text"):
-                    return block.text.strip()
-            return "I searched the drive but couldn't put together a response. Please try again."
+                    return SearchResult(block.text.strip())
+            return SearchResult("I searched the drive but couldn't put together a response. Please try again.")
 
         # Claude wants to call a tool
         if response.stop_reason == "tool_use":
@@ -208,11 +221,52 @@ def build_response(question: str, _files: list = None) -> str:
             # Unexpected stop reason
             break
 
-    return (
+    # Rounds exhausted — give Claude one final turn to answer from accumulated results
+    try:
+        final = _get_client().messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=1024,
+            system=_SYSTEM,
+            tools=_TOOLS,
+            tool_choice={"type": "none"},
+            messages=messages,
+        )
+        for block in final.content:
+            if hasattr(block, "text"):
+                return SearchResult(block.text.strip())
+    except Exception as exc:
+        logger.error("Final synthesis call failed: %s", exc)
+
+    return SearchResult(
         f"I searched the drive several times for *\"{_escape(question)}\"* "
         "but couldn't find a confident match. "
-        "Try rephrasing with the document's specific title or type."
+        "Try rephrasing with the document's specific title or type.",
+        no_results=True,
     )
+
+
+def build_web_response(question: str) -> str:
+    """Search the web via Claude's built-in web_search tool and return a Slack-formatted answer."""
+    try:
+        response = _get_client().messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=1024,
+            system=(
+                "You are a helpful assistant. Use the web_search tool to find relevant "
+                "information for the user's question. Return a concise answer with "
+                "source links formatted as Slack mrkdwn: *<url|Title>*. "
+                "List up to 5 sources. Use bullet points. "
+                "Use *single asterisks* for bold, NEVER **double asterisks**."
+            ),
+            tools=[{"type": "web_search_20250305"}],
+            messages=[{"role": "user", "content": question}],
+        )
+        for block in response.content:
+            if hasattr(block, "text"):
+                return block.text.strip()
+    except Exception as exc:
+        logger.error("Web search call failed: %s", exc)
+    return "I searched the web but couldn't find a useful answer. Try rephrasing your question."
 
 
 def _escape(text: str) -> str:

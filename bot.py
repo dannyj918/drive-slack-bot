@@ -29,7 +29,8 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 from dotenv import load_dotenv
 
 from drive_search import search_shared_drive
-from ai_handler import build_response
+from ai_handler import build_response, build_web_response, SearchResult
+from conversation import fetch_thread_history
 
 load_dotenv()
 
@@ -51,16 +52,17 @@ app = App(token=os.environ["SLACK_BOT_TOKEN"])
 # ---------------------------------------------------------------------------
 
 @app.command("/help")
-def handle_help(ack, respond, command):
+def handle_help(ack, respond, command, client):
     ack()
     question = command.get("text", "").strip()
+    user_id  = command["user_id"]
 
     if not question:
         respond(
             response_type="ephemeral",
             text=(
                 "🔍 *What are you looking for?*\n"
-                "Type `/help` followed by your question — only you'll see the results:\n\n"
+                "Type `/help` followed by your question — I'll DM you the results so you can follow up:\n\n"
                 "> `/help find the Q1 budget template`\n"
                 "> `/help listing presentation deck`\n"
                 "> `/help agent onboarding checklist`"
@@ -68,10 +70,27 @@ def handle_help(ack, respond, command):
         )
         return
 
-    # Run the search — response is ephemeral so only the asker sees it
-    respond(response_type="ephemeral", text="🔍 Searching the drive…")
-    response_text = _search_and_respond(question)
-    respond(response_type="ephemeral", text=response_text)
+    # Acknowledge in-channel (ephemeral), then send the real result to the user's DM
+    # so they can continue the conversation by replying there.
+    respond(response_type="ephemeral", text="🔍 Searching the drive… I'll send the results to your DMs.")
+    result = _search_and_respond(question)
+
+    dm = client.conversations_open(users=user_id)
+    dm_channel = dm["channel"]["id"]
+
+    if result.no_results:
+        client.chat_postMessage(
+            channel=dm_channel,
+            blocks=_web_search_offer_blocks(question),
+            text=result.text,
+            mrkdwn=True,
+        )
+    else:
+        client.chat_postMessage(
+            channel=dm_channel,
+            text=f"Results for `/help {question}`:\n\n{result.text}\n\n_Reply here to follow up._",
+            mrkdwn=True,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -111,7 +130,7 @@ def handle_app_mention(event, say, client):
     except Exception:
         pass  # Non-critical — carry on if reactions aren't enabled
 
-    response_text = _search_and_respond(question)
+    result = _search_and_respond(question)
 
     # Swap 👀 for ✅
     try:
@@ -120,20 +139,57 @@ def handle_app_mention(event, say, client):
     except Exception:
         pass
 
-    say(text=response_text, channel=channel, thread_ts=thread_ts)
+    if result.no_results:
+        say(blocks=_web_search_offer_blocks(question), text=result.text, channel=channel, thread_ts=thread_ts)
+    else:
+        say(text=result.text, channel=channel, thread_ts=thread_ts)
 
 
-def _search_and_respond(question: str) -> str:
+def _search_and_respond(question: str, history: list = None) -> SearchResult:
     """Run the Drive search and format a Slack-ready response."""
     try:
         files = search_shared_drive(question)
-        return build_response(question, files)
+        return build_response(question, files, history=history)
     except Exception as e:
         logger.error("Error during drive search: %s", e, exc_info=True)
-        return (
+        return SearchResult(
             "⚠️ Sorry, I hit an error searching the drive. "
             "Please try again in a moment, or contact your workspace admin."
         )
+
+
+def _web_search_offer_blocks(question: str) -> list[dict]:
+    return [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f"I searched the Shared Drive for *\"{question[:200]}\"* "
+                    "but couldn't find a confident match.\n\n"
+                    "Would you like me to search the web instead?"
+                ),
+            },
+        },
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Search the web"},
+                    "style": "primary",
+                    "action_id": "web_search_confirm",
+                    "value": question[:1900],
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "No thanks"},
+                    "action_id": "web_search_decline",
+                    "value": "dismiss",
+                },
+            ],
+        },
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -176,14 +232,17 @@ def handle_dm(event, say, client):
         )
         return
 
-    logger.info("DM Drive search | user=%s | query=%r", user_id, question)
+    thread_ts = event.get("thread_ts")
+    history   = fetch_thread_history(client, channel, thread_ts) if thread_ts else None
+
+    logger.info("DM Drive search | user=%s | query=%r | thread=%s", user_id, question, bool(thread_ts))
 
     try:
         client.reactions_add(channel=channel, name="eyes", timestamp=event_ts)
     except Exception:
         pass
 
-    response_text = _search_and_respond(question)
+    result = _search_and_respond(question, history=history)
 
     try:
         client.reactions_remove(channel=channel, name="eyes", timestamp=event_ts)
@@ -191,8 +250,46 @@ def handle_dm(event, say, client):
     except Exception:
         pass
 
-    # DMs don't use thread_ts — just reply directly
-    say(text=response_text, channel=channel)
+    thread_kwargs = {"thread_ts": thread_ts} if thread_ts else {}
+    if result.no_results:
+        say(blocks=_web_search_offer_blocks(question), text=result.text, channel=channel, **thread_kwargs)
+    else:
+        say(text=result.text, channel=channel, **thread_kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Actions: web search offer buttons
+# ---------------------------------------------------------------------------
+
+@app.action("web_search_confirm")
+def handle_web_search_confirm(ack, body, client):
+    ack()
+    question   = body["actions"][0]["value"]
+    channel    = body["container"]["channel_id"]
+    message_ts = body["container"]["message_ts"]
+    thread_ts  = body["container"].get("thread_ts", message_ts)
+
+    client.chat_update(channel=channel, ts=message_ts, text="Searching the web\u2026", blocks=[])
+
+    response_text = build_web_response(question)
+    client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=response_text, mrkdwn=True)
+
+
+@app.action("web_search_decline")
+def handle_web_search_decline(ack, body, client):
+    ack()
+    channel    = body["container"]["channel_id"]
+    message_ts = body["container"]["message_ts"]
+    original   = next(
+        (b["text"]["text"] for b in body["message"].get("blocks", []) if b["type"] == "section"),
+        body["message"].get("text", ""),
+    )
+    client.chat_update(
+        channel=channel,
+        ts=message_ts,
+        text=original,
+        blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": original}}],
+    )
 
 
 # ---------------------------------------------------------------------------

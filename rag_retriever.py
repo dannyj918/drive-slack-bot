@@ -19,7 +19,6 @@ import openai
 logger = logging.getLogger(__name__)
 
 _openai_client: openai.OpenAI | None = None
-_collection: chromadb.Collection | None = None
 
 EMBEDDING_MODEL = "text-embedding-3-small"
 COLLECTION_NAME = "drive_docs"
@@ -34,13 +33,9 @@ def _get_openai_client() -> openai.OpenAI:
 
 def _get_collection() -> chromadb.Collection | None:
     """
-    Lazy-load the Chroma collection.
-    Returns None if the index hasn't been built yet (rag_indexer.py not yet run).
+    Open a fresh Chroma client on every call so queries always see the latest
+    index written by rag_indexer.py without requiring a bot restart.
     """
-    global _collection
-    if _collection is not None:
-        return _collection
-
     db_path = os.environ.get("CHROMA_DB_PATH", "./chroma_db")
     if not os.path.exists(db_path):
         logger.warning(
@@ -50,9 +45,9 @@ def _get_collection() -> chromadb.Collection | None:
 
     try:
         client = chromadb.PersistentClient(path=db_path)
-        _collection = client.get_collection(COLLECTION_NAME)
-        logger.info("RAG collection loaded: %d chunks", _collection.count())
-        return _collection
+        collection = client.get_collection(COLLECTION_NAME)
+        logger.info("RAG collection loaded: %d chunks", collection.count())
+        return collection
     except Exception as exc:
         logger.warning("Could not load RAG collection: %s", exc)
         return None
