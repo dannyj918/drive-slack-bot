@@ -151,6 +151,9 @@ It handles vague questions well — e.g. *"that onboarding thing"* or *"the Smit
 
 For a long-lived deployment, run the bot as a background process or system service.
 
+**Cloud deploy (recommended — no local machine needed):** See [DEPLOY.md](DEPLOY.md) for
+Fly.io, Railway, Render, and VPS instructions with Docker.
+
 **Using `nohup` (quick and dirty):**
 ```bash
 nohup python bot.py > bot.log 2>&1 &

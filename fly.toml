@@ -1,0 +1,35 @@
+# Fly.io config — see DEPLOY.md for setup steps.
+app = "metalios-drive-bot"
+primary_region = "iad"
+
+[build]
+
+[env]
+  CHROMA_DB_PATH = "/data/chroma_db"
+  CHANGES_TOKEN_FILE = "/data/changes_token.txt"
+
+[mounts]
+  source = "drive_bot_data"
+  destination = "/data"
+
+[[vm]]
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1
+
+[processes]
+  app = "python bot.py"
+
+# Run the RAG indexer every 30 minutes (optional — remove if you skip RAG).
+# Requires: fly extensions create cron
+# Then deploy with this schedule block uncommented.
+#
+# [[services]]
+#   internal_port = 8080
+#   processes = ["app"]
+#   protocol = "tcp"
+#
+# [checks]
+#   [checks.alive]
+#     type = "process"
+#     processes = ["app"]
