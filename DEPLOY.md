@@ -85,7 +85,7 @@ upload needed.
 Optional:
 
 ```bash
-fly secrets set CLAUDE_MODEL="claude-sonnet-4-5"
+fly secrets set CLAUDE_MODEL="claude-sonnet-4-6"
 ```
 
 ### 5. Deploy
@@ -224,7 +224,7 @@ This is still "cloud" — just you manage the VM instead of a PaaS.
 | `GOOGLE_SERVICE_ACCOUNT_FILE` | yes* | File path — use on VPS with mounted file |
 | `CHROMA_DB_PATH` | no | Default `./chroma_db`; use `/data/chroma_db` with a volume |
 | `CHANGES_TOKEN_FILE` | no | Default `changes_token.txt`; use `/data/changes_token.txt` with a volume |
-| `CLAUDE_MODEL` | no | Default `claude-sonnet-4-5` |
+| `CLAUDE_MODEL` | no | Default `claude-sonnet-4-6` |
 
 \* Provide one of the two Google credential options.
 

@@ -85,7 +85,7 @@ All secrets live in `.env` (never committed). See `.env.example` for the full te
 | `OPENAI_API_KEY` | yes (for RAG) | — | OpenAI key for `text-embedding-3-small` embeddings |
 | `GOOGLE_SERVICE_ACCOUNT_FILE` | yes | `service_account.json` | Path to service account JSON key |
 | `SHARED_DRIVE_ID` | yes | — | Google Shared Drive ID (from the drive URL) |
-| `CLAUDE_MODEL` | no | `claude-sonnet-4-5` | Swap to `claude-haiku-4-5-20251001` for speed/cost |
+| `CLAUDE_MODEL` | no | `claude-sonnet-4-6` | Swap to `claude-haiku-4-5-20251001` for speed/cost |
 | `CHROMA_DB_PATH` | no | `./chroma_db` | Where Chroma persists the vector DB on disk |
 
 The service account JSON file is gitignored — it must be placed manually.
@@ -185,7 +185,7 @@ The `_files` parameter in `build_response` is accepted but ignored — the agent
 
 ### Anthropic Claude
 - Uses the `anthropic` SDK with tool use (function calling)
-- Default model: `claude-sonnet-4-5`; configurable via `CLAUDE_MODEL`
+- Default model: `claude-sonnet-4-6`; configurable via `CLAUDE_MODEL`
 - `max_tokens=1024` per request — sufficient for Slack responses
 - Client is a lazy singleton (`_client` global in `ai_handler.py`)
 

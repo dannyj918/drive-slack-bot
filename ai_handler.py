@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 _client: anthropic.Anthropic | None = None
 
 MAX_SEARCH_ROUNDS = 4   # Claude can call search_drive up to this many times
-CLAUDE_MODEL      = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-5")
+CLAUDE_MODEL      = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
 
 
 def _get_client() -> anthropic.Anthropic:
