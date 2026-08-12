@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 _openai_client: openai.OpenAI | None = None
 
-EMBEDDING_MODEL = "text-embedding-3-small"
+EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "text-embedding-3-small")
 COLLECTION_NAME = "drive_docs"
 
 
