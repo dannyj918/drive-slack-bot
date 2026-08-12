@@ -52,7 +52,7 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-EMBEDDING_MODEL    = "text-embedding-3-small"
+EMBEDDING_MODEL    = os.environ.get("EMBEDDING_MODEL", "text-embedding-3-small")
 COLLECTION_NAME    = "drive_docs"
 CHANGES_TOKEN_FILE = os.environ.get("CHANGES_TOKEN_FILE", "changes_token.txt")
 CHUNK_SIZE         = 500   # words per chunk
@@ -285,7 +285,7 @@ def chunk_text(text: str) -> list[str]:
 
 
 def embed_texts(texts: list[str]) -> list[list[float]]:
-    """Embed a list of strings using OpenAI text-embedding-3-small, in batches."""
+    """Embed a list of strings using the configured OpenAI embedding model, in batches."""
     client = _get_openai_client()
     embeddings: list[list[float]] = []
 
