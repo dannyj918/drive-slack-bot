@@ -12,6 +12,7 @@ Usage:
   In a DM — just message it directly (no @mention needed):
     Where's the listing presentation?
     Find the agent onboarding checklist
+    (or send a screenshot / photo — the bot will read it and search)
 
 The bot searches the Shared Drive and replies in-thread with
 direct links to matching files.
@@ -31,6 +32,7 @@ from dotenv import load_dotenv
 from drive_search import search_shared_drive
 from ai_handler import build_response, build_web_response, SearchResult
 from conversation import fetch_thread_history
+from slack_files import download_slack_images, extract_image_files
 
 load_dotenv()
 
@@ -145,11 +147,15 @@ def handle_app_mention(event, say, client):
         say(text=result.text, channel=channel, thread_ts=thread_ts)
 
 
-def _search_and_respond(question: str, history: list = None) -> SearchResult:
+def _search_and_respond(
+    question: str,
+    history: list = None,
+    images: list[dict] | None = None,
+) -> SearchResult:
     """Run the Drive search and format a Slack-ready response."""
     try:
-        files = search_shared_drive(question)
-        return build_response(question, files, history=history)
+        files = search_shared_drive(question) if question else []
+        return build_response(question, files, history=history, images=images)
     except Exception as e:
         logger.error("Error during drive search: %s", e, exc_info=True)
         return SearchResult(
@@ -205,14 +211,37 @@ def handle_assistant_thread_started(event, say):
 # Event: message in DMs — fires when someone messages the bot directly
 # ---------------------------------------------------------------------------
 
+# Subtypes we intentionally ignore (edits, deletes, bot echoes, etc.)
+# file_share is handled — that's how Slack delivers image uploads.
+_IGNORED_DM_SUBTYPES = frozenset({
+    "bot_message",
+    "message_changed",
+    "message_deleted",
+    "message_replied",
+    "channel_join",
+    "channel_leave",
+    "channel_topic",
+    "channel_purpose",
+    "channel_name",
+    "channel_archive",
+    "channel_unarchive",
+    "pinned_item",
+    "unpinned_item",
+    "ekm_access_denied",
+})
+
+
 @app.event("message")
 def handle_dm(event, say, client):
     # Only handle direct messages (channel_type "im"), ignore everything else
     if event.get("channel_type") != "im":
         return
 
-    # Ignore bot messages and message edits/deletes
-    if event.get("bot_id") or event.get("subtype"):
+    # Ignore bot messages and non-user subtypes (but allow file_share)
+    if event.get("bot_id"):
+        return
+    subtype = event.get("subtype")
+    if subtype in _IGNORED_DM_SUBTYPES:
         return
 
     question = event.get("text", "").strip()
@@ -220,29 +249,60 @@ def handle_dm(event, say, client):
     channel  = event["channel"]
     event_ts = event["ts"]
 
-    if not question:
+    image_metas = extract_image_files(event)
+    images = download_slack_images(event, os.environ["SLACK_BOT_TOKEN"]) if image_metas else []
+
+    if not question and not images:
+        if image_metas:
+            say(
+                text=(
+                    "I saw your image but couldn't download it. "
+                    "Please try sending it again, or ask me in text."
+                ),
+                channel=channel,
+            )
+            return
+        if event.get("files"):
+            say(
+                text=(
+                    "I can look at images (PNG, JPEG, GIF, WebP) and search the "
+                    "Shared Drive for matching docs. That file type isn't supported yet — "
+                    "try a screenshot or photo, or ask me in text."
+                ),
+                channel=channel,
+            )
+            return
         say(
             text=(
                 "Hey! 👋 Just ask me what you're looking for — for example:\n"
                 "• _Find the Q1 budget template_\n"
                 "• _Where's the listing presentation deck?_\n"
-                "• _Show me the agent onboarding checklist_"
+                "• _Show me the agent onboarding checklist_\n\n"
+                "You can also send a screenshot or photo and I'll search for matching files."
             ),
             channel=channel,
         )
         return
 
+    if not question and images:
+        question = (
+            "Find Shared Drive documents that match what's shown in the attached image(s)."
+        )
+
     thread_ts = event.get("thread_ts")
     history   = fetch_thread_history(client, channel, thread_ts) if thread_ts else None
 
-    logger.info("DM Drive search | user=%s | query=%r | thread=%s", user_id, question, bool(thread_ts))
+    logger.info(
+        "DM Drive search | user=%s | query=%r | images=%d | thread=%s",
+        user_id, question, len(images), bool(thread_ts),
+    )
 
     try:
         client.reactions_add(channel=channel, name="eyes", timestamp=event_ts)
     except Exception:
         pass
 
-    result = _search_and_respond(question, history=history)
+    result = _search_and_respond(question, history=history, images=images or None)
 
     try:
         client.reactions_remove(channel=channel, name="eyes", timestamp=event_ts)

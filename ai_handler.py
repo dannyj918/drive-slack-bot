@@ -99,6 +99,10 @@ Rules:
 4. If content_chunks are returned, use them to answer the question, then cite the source file.
 5. If only file links are returned (no content), share the link so the user can open it.
 6. Always include the source file link when answering from content.
+7. If the user attached image(s), inspect them carefully (screenshots, forms, flyers,
+   handwritten notes, document photos). Extract titles, names, dates, addresses, and
+   other distinctive terms, then search the Shared Drive for matching documents.
+   Prefer search queries grounded in text visible in the image.
 
 Slack formatting rules (mrkdwn — strictly follow Slack syntax, NOT markdown):
 - Use *single asterisks* for bold, NEVER **double asterisks**
@@ -124,7 +128,12 @@ Do NOT add preamble like "Sure!" or "I found the following…" — get straight 
 # Public entry point
 # ---------------------------------------------------------------------------
 
-def build_response(question: str, _files: list = None, history: list = None) -> SearchResult:
+def build_response(
+    question: str,
+    _files: list = None,
+    history: list = None,
+    images: list[dict] | None = None,
+) -> SearchResult:
     """
     Run an agentic search loop: Claude decides what to search for,
     calls search_drive as many times as it needs, and returns a
@@ -132,14 +141,14 @@ def build_response(question: str, _files: list = None, history: list = None) -> 
 
     The `_files` parameter is accepted for compatibility but ignored —
     the agentic loop does its own searching.
+
+    `images` is an optional list of dicts with keys media_type, data (base64),
+    and optional name — Slack image attachments to send as vision input.
     """
     messages = (history or []) + [
         {
             "role": "user",
-            "content": (
-                f'A Metalios team member asked: "{question}"\n\n'
-                "Find the most relevant files in the Shared Drive and reply."
-            ),
+            "content": _build_user_content(question, images),
         }
     ]
 
@@ -267,6 +276,36 @@ def build_web_response(question: str) -> str:
     except Exception as exc:
         logger.error("Web search call failed: %s", exc)
     return "I searched the web but couldn't find a useful answer. Try rephrasing your question."
+
+
+def _build_user_content(question: str, images: list[dict] | None) -> str | list[dict]:
+    """Build Claude user content — plain text, or multimodal blocks when images are present."""
+    text = (
+        f'A Metalios team member asked: "{question}"\n\n'
+        "Find the most relevant files in the Shared Drive and reply."
+    )
+    if images:
+        text += (
+            "\n\nThey also attached image(s). Read the image(s), extract useful "
+            "search terms (titles, names, form labels, addresses, dates), and "
+            "search the Shared Drive for matching documents."
+        )
+
+    if not images:
+        return text
+
+    content: list[dict] = []
+    for img in images:
+        content.append({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": img["media_type"],
+                "data": img["data"],
+            },
+        })
+    content.append({"type": "text", "text": text})
+    return content
 
 
 def _escape(text: str) -> str:
