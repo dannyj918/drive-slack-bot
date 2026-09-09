@@ -49,6 +49,7 @@ oauth_config:
       - app_mentions:read
       - chat:write
       - reactions:write
+      - files:read
       - im:history
       - im:read
       - im:write
